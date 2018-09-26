@@ -33,10 +33,15 @@
 #include <cstring>
 #include <cerrno>
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+
+#ifndef PACKAGE_STRING
+#define PACKAGE_STRING "patchelf"
+#endif
+#ifndef PAGESIZE
+#define PAGESIZE 4096
+#endif
 
 #include "elf.h"
 
@@ -296,7 +301,7 @@ struct SysError : std::runtime_error
 };
 
 
-__attribute__((noreturn)) static void error(std::string msg)
+[[noreturn]] static void error(std::string msg)
 {
     if (errno)
         throw SysError(msg);
@@ -312,39 +317,32 @@ static void growFile(FileContents contents, size_t newSize)
     contents->resize(newSize, 0);
 }
 
+static std::ifstream openFileToRead(std::filesystem::path fileName)
+{
+    std::ifstream in{ fileName, std::ios::binary };
+    if(!in)
+        throw SysError(fmt("opening file to read: '", fileName, "'"));
 
-static FileContents readFile(std::string fileName,
+    return in;
+}
+
+static FileContents readFile(std::filesystem::path fileName,
     size_t cutOff = std::numeric_limits<size_t>::max())
 {
-    struct stat st;
-    if (stat(fileName.c_str(), &st) != 0)
-        throw SysError(fmt("getting info about '", fileName, "'"));
-
-    if ((uint64_t) st.st_size > (uint64_t) std::numeric_limits<size_t>::max())
-        throw SysError(fmt("cannot read file of size ", st.st_size, " into memory"));
-
-    size_t size = std::min(cutOff, (size_t) st.st_size);
+    auto input = openFileToRead(fileName);
 
     FileContents contents = std::make_shared<std::vector<unsigned char>>();
-    contents->reserve(size + 32 * 1024 * 1024);
-    contents->resize(size, 0);
-
-    int fd = open(fileName.c_str(), O_RDONLY);
-    if (fd == -1) throw SysError(fmt("opening '", fileName, "'"));
-
-    size_t bytesRead = 0;
-    ssize_t portion;
-    while ((portion = read(fd, contents->data() + bytesRead, size - bytesRead)) > 0)
-        bytesRead += portion;
-
-    if (bytesRead != size)
-        throw SysError(fmt("reading '", fileName, "'"));
-
-    close(fd);
+    input.seekg(0, std::ios::end);
+    const int64_t filesize = input.tellg();
+    contents->reserve(filesize + 32 * 1024 * 1024);
+    contents->resize(filesize, 0);
+    input.seekg(0, std::ios::beg);
+    input.read(reinterpret_cast<char*>(contents->data()), contents->size());
+    if(!input)
+        throw SysError(fmt("failed reading file '", fileName, "'"));
 
     return contents;
 }
-
 
 struct ElfType
 {
@@ -495,24 +493,22 @@ void ElfFile<ElfFileParamNames>::sortShdrs()
 }
 
 
-static void writeFile(std::string fileName, FileContents contents)
+static std::ofstream openFileToWrite(std::filesystem::path fileName)
 {
-    int fd = open(fileName.c_str(), O_TRUNC | O_WRONLY);
-    if (fd == -1)
-        error("open");
+    std::ofstream out{ fileName, std::ios::binary };
+    if(!out)
+        throw SysError(fmt("opening file to read: '", fileName, "'"));
 
-    size_t bytesWritten = 0;
-    ssize_t portion;
-    while ((portion = write(fd, contents->data() + bytesWritten, contents->size() - bytesWritten)) > 0)
-        bytesWritten += portion;
-
-    if (bytesWritten != contents->size())
-        error("write");
-
-    if (close(fd) != 0)
-        error("close");
+    return out;
 }
 
+static void writeFile(std::filesystem::path fileName, std::string_view contents)
+{
+    auto file = openFileToWrite(fileName);
+    file.write(contents.data(), contents.size());
+    if(!file)
+        throw SysError(fmt("error when writing file: '", fileName, "'"));
+}
 
 static unsigned int roundUp(unsigned int n, unsigned int m)
 {
@@ -1601,7 +1597,8 @@ static void patchElf2(ElfFile && elfFile, std::string fileName)
 
     if (elfFile.isChanged()){
         elfFile.rewriteSections();
-        writeFile(fileName, elfFile.fileContents);
+        std::string_view contentsView(reinterpret_cast<const char*>(elfFile.fileContents->data()), elfFile.fileContents->size());
+        writeFile(std::filesystem::u8path(fileName), contentsView);
     }
 }
 
